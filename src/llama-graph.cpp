@@ -1391,11 +1391,85 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     pos_bias = ggml_reshape_3d(ctx0, pos_bias, pos_bias->ne[0], pos_bucket->ne[0], pos_bucket->ne[1]);
     pos_bias = ggml_permute   (ctx0, pos_bias, 2, 0, 1, 3);
     pos_bias = ggml_cont      (ctx0, pos_bias);
-
     cb(pos_bias, "pos_bias", -1);
 
     return pos_bias;
 }
+
+static void sparse_attn(
+        struct ggml_tensor * dst, 
+        const struct ggml_tensor * a, 
+        const struct ggml_tensor * b, 
+        const struct ggml_tensor * c, 
+        int ith, 
+        int nth, 
+        void * userdata) {
+    const int n_embd_h   = (int)b->ne[0];
+    const int n_tokens_q = (int)b->ne[1];
+    const int n_tokens_k = (int)c->ne[1];
+    const int n_heads    = (int)b->ne[2];
+    const int n_heads_k  = (int)c->ne[2];
+    const int n_batch    = (int)b->ne[3];
+
+    const size_t q_nb1 = b->nb[1];
+    const size_t q_nb2 = b->nb[2];
+    const size_t q_nb3 = b->nb[3];
+
+    const size_t k_nb1 = c->nb[1];
+    const size_t k_nb2 = c->nb[2];
+    const size_t k_nb3 = c->nb[3];
+
+    const size_t dst_nb1 = dst->nb[1];
+    const size_t dst_nb2 = dst->nb[2];
+    const size_t dst_nb3 = dst->nb[3];
+
+    const int gqa_ratio = n_heads / n_heads_k;
+
+    // 多线程分片：按 Head 分派任务
+    const int heads_per_thread = (n_heads + nth - 1) / nth;
+    const int h_start = ith * heads_per_thread;
+    const int h_end   = (h_start + heads_per_thread < n_heads) ? (h_start + heads_per_thread) : n_heads;
+
+    if (h_start >= n_heads) return;
+
+    // 稀疏阈值：只保留绝对值足够大的能量，其余视为噪声剔除
+    // 对于 unscaled 点积，0.5 是一个非常保守且安全的起步值
+    const float theta = 0.5f; 
+
+    for (int ib = 0; ib < n_batch; ib++) {
+        for (int ih = h_start; ih < h_end; ih++) {
+            int mapped_k_head = ih / gqa_ratio;
+
+            char * q_head_ptr   = ((char *)b->data)   + ib * q_nb3 + ih * q_nb2;
+            char * k_head_ptr   = ((char *)c->data)   + ib * k_nb3 + mapped_k_head * k_nb2;
+            char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
+
+            for (int iq = 0; iq < n_tokens_q; iq++) {
+                const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
+                float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);
+
+                for (int ik = 0; ik < n_tokens_k; ik++) {
+                    const float * k_col = (const float *)(k_head_ptr + ik * k_nb1);
+                    
+                    float dot = 0.0f;
+                    for (int i = 0; i < n_embd_h; i++) {
+                        dot += q_row[i] * k_col[i];
+                    }
+
+                    if (fabsf(dot) >= theta) {
+                        row_out[ik] = dot;
+                    } else {
+                        row_out[ik] = -10000.0f; // 稀疏屏蔽
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
+
 
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
@@ -1462,12 +1536,26 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        // ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+
+        static bool graph_first_run = true;
+        if (graph_first_run) {
+             printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
+             graph_first_run = false;
+        }
+
+        // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
+        ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+        ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
+        
+        // 正式挂载 Sparse Attention 节点
+        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        // ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
