@@ -1432,9 +1432,8 @@ static void sparse_attn(
 
     if (h_start >= n_heads) return;
 
-    // 稀疏阈值：只保留绝对值足够大的能量，其余视为噪声剔除
-    // 对于 unscaled 点积，0.5 是一个非常保守且安全的起步值
-    const float theta = 0.5f; 
+    // 稀疏性阈值
+    const float theta = 0.1f; 
 
     for (int ib = 0; ib < n_batch; ib++) {
         for (int ih = h_start; ih < h_end; ih++) {
@@ -1444,23 +1443,35 @@ static void sparse_attn(
             char * k_head_ptr   = ((char *)c->data)   + ib * k_nb3 + mapped_k_head * k_nb2;
             char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
 
+            // 🔥 线程局部清零：防止并发破坏多线程环境下的累加逻辑
             for (int iq = 0; iq < n_tokens_q; iq++) {
-                const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
+                memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
+            }
+
+            // 1. 求出稀疏的 Delta K 并计算 Delta R = Q * Delta K
+            for (int ik = 0; ik < n_tokens_k; ik++) {
+                const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
+                const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);
+
+                for (int d = 0; d < n_embd_h; d++) {
+                    float delta = (ik == 0) ? k_current[d] : (k_current[d] - k_previous[d]);
+
+                    // 核心稀疏性裁剪：只有差异显著的维度才进行更新
+                    if (fabsf(delta) >= theta) {
+                        for (int iq = 0; iq < n_tokens_q; iq++) {
+                            const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
+                            float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
+                            *out_val += delta * q_row[d];
+                        }
+                    }
+                }
+            }
+
+            // 2. 递归还原 (Prefix Sum)：将增量累加回原始能量分布
+            for (int iq = 0; iq < n_tokens_q; iq++) {
                 float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);
-
-                for (int ik = 0; ik < n_tokens_k; ik++) {
-                    const float * k_col = (const float *)(k_head_ptr + ik * k_nb1);
-                    
-                    float dot = 0.0f;
-                    for (int i = 0; i < n_embd_h; i++) {
-                        dot += q_row[i] * k_col[i];
-                    }
-
-                    if (fabsf(dot) >= theta) {
-                        row_out[ik] = dot;
-                    } else {
-                        row_out[ik] = -10000.0f; // 稀疏屏蔽
-                    }
+                for (int ik = 1; ik < n_tokens_k; ik++) {
+                    row_out[ik] += row_out[ik - 1];
                 }
             }
         }
