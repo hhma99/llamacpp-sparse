@@ -1399,8 +1399,8 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 static void sparse_attn(
         struct ggml_tensor * dst, 
         const struct ggml_tensor * a, 
-        const struct ggml_tensor * b, 
-        const struct ggml_tensor * c, 
+        const struct ggml_tensor * b, // q
+        const struct ggml_tensor * c, // k
         int ith, 
         int nth, 
         void * userdata) {
@@ -1432,44 +1432,48 @@ static void sparse_attn(
 
     if (h_start >= n_heads) return;
 
-    // 稀疏性阈值
-    const float theta = 0.1f; 
+    // 
+    const float theta = 0.0f; 
 
     for (int ib = 0; ib < n_batch; ib++) {
         for (int ih = h_start; ih < h_end; ih++) {
-            int mapped_k_head = ih / gqa_ratio;
+            int mapped_k_head = ih / gqa_ratio;     // Q头0,1,2,3 → K头0；Q头4,5,6,7 → K头1
 
-            char * q_head_ptr   = ((char *)b->data)   + ib * q_nb3 + ih * q_nb2;
+            char * q_head_ptr   = ((char *)b->data)   + ib * q_nb3 + ih * q_nb2;    // 跳过前面的batch 跳过前面的head（每头=256字节）
             char * k_head_ptr   = ((char *)c->data)   + ib * k_nb3 + mapped_k_head * k_nb2;
             char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
 
-            // 🔥 线程局部清零：防止并发破坏多线程环境下的累加逻辑
+
             for (int iq = 0; iq < n_tokens_q; iq++) {
                 memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
             }
 
-            // 1. 求出稀疏的 Delta K 并计算 Delta R = Q * Delta K
+            // 1.  Delta K , Delta R = Q * Delta K
             for (int ik = 0; ik < n_tokens_k; ik++) {
                 const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
-                const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);
+                const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);    // k_nb1 = 256 = n_embd_h * sizeof(float)
 
                 for (int d = 0; d < n_embd_h; d++) {
-                    float delta = (ik == 0) ? k_current[d] : (k_current[d] - k_previous[d]);
+                    float delta = (ik == 0) ? k_current[d] : (k_current[d] - k_previous[d]);    // token0? delta k 
 
-                    // 核心稀疏性裁剪：只有差异显著的维度才进行更新
+                    // 
                     if (fabsf(delta) >= theta) {
                         for (int iq = 0; iq < n_tokens_q; iq++) {
-                            const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
+                            const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);     // 
                             float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
-                            *out_val += delta * q_row[d];
+                            *out_val += delta * q_row[d];   // dst[iq][ik]
                         }
                     }
                 }
             }
+                            // dst ne: [256,      1,        32,       1      ]
+                            //          n_tokens_k n_tokens_q n_heads   n_batch
+                            // dst nb: [4,        1024,     1024,     32768  ]
+                            //          sizeof(f32) ↑         ↑
 
-            // 2. 递归还原 (Prefix Sum)：将增量累加回原始能量分布
+            // 
             for (int iq = 0; iq < n_tokens_q; iq++) {
-                float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);
+                float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);   // dst[iq][0]
                 for (int ik = 1; ik < n_tokens_k; ik++) {
                     row_out[ik] += row_out[ik - 1];
                 }
@@ -1547,22 +1551,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        // ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
-        static bool graph_first_run = true;
-        if (graph_first_run) {
-             printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
-             graph_first_run = false;
-        }
+        // static bool graph_first_run = true;
+        // if (graph_first_run) {
+        //      printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
+        //      graph_first_run = false;
+        // }
 
-        // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
-        ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
-        ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
-        ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
+        // // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
+        // ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        // ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+        // ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
         
-        // 正式挂载 Sparse Attention 节点
-        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
-        cb(kq, "kq", il);
+        // // 正式挂载 Sparse Attention 节点
+        // ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
+        // cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
