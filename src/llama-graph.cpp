@@ -1396,6 +1396,16 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+#include <atomic>
+#include <immintrin.h> // 引入 AVX/AVX2 指令集
+
+static std::atomic<int64_t> g_sparse_attn_time_us(0);
+static std::atomic<int64_t> g_sparse_attn_calls(0);
+
+// 强制告诉 GCC 这个函数要使用 AVX2 编译
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx,avx2,fma")))
+#endif
 static void sparse_attn(
         struct ggml_tensor * dst, 
         const struct ggml_tensor * a, 
@@ -1432,8 +1442,10 @@ static void sparse_attn(
 
     if (h_start >= n_heads) return;
 
+    int64_t t_start = (ith == 0) ? ggml_time_us() : 0;
+
     // 
-    const float theta = 0.0f; 
+    const float theta = 0.4f; 
 
     for (int ib = 0; ib < n_batch; ib++) {
         for (int ih = h_start; ih < h_end; ih++) {
@@ -1447,7 +1459,7 @@ static void sparse_attn(
             for (int iq = 0; iq < n_tokens_q; iq++) {
                 memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
             }
-
+            /*
             // 1.  Delta K , Delta R = Q * Delta K
             for (int ik = 0; ik < n_tokens_k; ik++) {
                 const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
@@ -1466,6 +1478,55 @@ static void sparse_attn(
                     }
                 }
             }
+            */
+            // 1.  Delta K , Delta R = Q * Delta K
+            for (int ik = 0; ik < n_tokens_k; ik++) {
+                const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
+                const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);    // k_nb1 = 256 = n_embd_h * sizeof(float)
+
+                
+                const __m256 v_theta = _mm256_set1_ps(theta);
+                const __m256 v_abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)); // abs mask _mm256_castsi256_ps bit -> float /_mm256_set1_epi32 copy
+
+                for (int d = 0; d < n_embd_h; d += 8) {
+                    // load 8 K
+                    __m256 v_k_curr = _mm256_loadu_ps(k_current + d);
+                    __m256 v_k_prev = (ik == 0) ? _mm256_setzero_ps() : _mm256_loadu_ps(k_previous + d);
+                    
+                    // get delta
+                    __m256 v_delta  = _mm256_sub_ps(v_k_curr, v_k_prev);
+
+                    // abs theta then compare
+                    __m256 v_abs_delta = _mm256_and_ps(v_abs_mask, v_delta);
+                    __m256 v_mask = _mm256_cmp_ps(v_abs_delta, v_theta, _CMP_GE_OQ); // _CMP_GE_OQ >=, ordered
+
+                    // jump
+                    if (_mm256_movemask_ps(v_mask) == 0) {  // movemask 0000000, highest bit
+                        continue;
+                    }
+
+                    // mask the delta and *q
+                    __m256 v_masked_delta = _mm256_and_ps(v_delta, v_mask);
+
+                    for (int iq = 0; iq < n_tokens_q; iq++) {
+                        const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
+                        float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
+                        
+                        // load 8 q
+                        __m256 v_q = _mm256_loadu_ps(q_row + d);
+                        __m256 v_prod = _mm256_mul_ps(v_masked_delta, v_q);
+
+                        // sum
+                        __m128 v_low = _mm256_castps256_ps128(v_prod);
+                        __m128 v_high = _mm256_extractf128_ps(v_prod, 1);
+                        __m128 v_sum4 = _mm_add_ps(v_low, v_high);
+                        __m128 v_sum2 = _mm_add_ps(v_sum4, _mm_movehl_ps(v_sum4, v_sum4));
+                        __m128 v_sum1 = _mm_add_ss(v_sum2, _mm_shuffle_ps(v_sum2, v_sum2, 0x55));
+                        
+                        *out_val += _mm_cvtss_f32(v_sum1);
+                    }
+                }
+            }
                             // dst ne: [256,      1,        32,       1      ]
                             //          n_tokens_k n_tokens_q n_heads   n_batch
                             // dst nb: [4,        1024,     1024,     32768  ]
@@ -1478,6 +1539,16 @@ static void sparse_attn(
                     row_out[ik] += row_out[ik - 1];
                 }
             }
+        }
+    }
+
+    if (ith == 0) {
+        g_sparse_attn_time_us += (ggml_time_us() - t_start);
+        g_sparse_attn_calls++;
+        if (g_sparse_attn_calls % 16 == 0) {
+            printf("\n[SparseAttn Perf] Avg time per layer: %lld us (theta=%.3f)\n", 
+                   (long long)(g_sparse_attn_time_us / 16), theta);
+            g_sparse_attn_time_us = 0;
         }
     }
 }
@@ -1551,22 +1622,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        // ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
-        // static bool graph_first_run = true;
-        // if (graph_first_run) {
-        //      printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
-        //      graph_first_run = false;
-        // }
+        static bool graph_first_run = true;
+        if (graph_first_run) {
+             printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
+             graph_first_run = false;
+        }
 
-        // // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
-        // ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
-        // ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
-        // ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
+        // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
+        ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+        ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
         
-        // // 正式挂载 Sparse Attention 节点
-        // ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
-        // cb(kq, "kq", il);
+        // 正式挂载 Sparse Attention 节点
+        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
+        cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
