@@ -1494,6 +1494,11 @@ static void sparse_attn(
                 const __m256 v_theta = _mm256_set1_ps(theta);
                 const __m256 v_abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)); // abs mask _mm256_castsi256_ps bit -> float /_mm256_set1_epi32 copy
 
+                // pre scan, record the valid d
+                int valid_d[8];
+                __m256 valid_deltas[8];
+                int valid_count = 0;
+
                 for (int d = 0; d < n_embd_h; d += 8) {
                     // load 8 K
                     __m256 v_k_curr = _mm256_loadu_ps(k_current + d);
@@ -1528,21 +1533,34 @@ static void sparse_attn(
                         continue;
                     }
 
-                    // mask the delta and *q
+                    // mask the delta
                     __m256 v_masked_delta = _mm256_and_ps(v_delta, v_mask);
 
+                    valid_d[valid_count] = d;
+                    valid_deltas[valid_count] = v_masked_delta;
+                    valid_count++;
+                }
+
+                // Fast compute: outer iq, inner d
+                // Before: valid_count * n_tokens_q hadds
+                // After:  n_tokens_q hadds
+                if (valid_count > 0) {
                     int64_t t_m_start = (ith == 0) ? ggml_time_us() : 0;
                     for (int iq = 0; iq < n_tokens_q; iq++) {
                         const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
                         float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
                         
-                        // load 8 q
-                        __m256 v_q = _mm256_loadu_ps(q_row + d);
-                        __m256 v_prod = _mm256_mul_ps(v_masked_delta, v_q);
+                        __m256 v_sum = _mm256_setzero_ps();
+                        
+                        // fma
+                        for (int idx = 0; idx < valid_count; idx++) {
+                            __m256 v_q = _mm256_loadu_ps(q_row + valid_d[idx]);
+                            v_sum = _mm256_fmadd_ps(valid_deltas[idx], v_q, v_sum);
+                        }
 
-                        // sum
-                        __m128 v_low = _mm256_castps256_ps128(v_prod);
-                        __m128 v_high = _mm256_extractf128_ps(v_prod, 1);
+                        // once (hadd)
+                        __m128 v_low = _mm256_castps256_ps128(v_sum);
+                        __m128 v_high = _mm256_extractf128_ps(v_sum, 1);
                         __m128 v_sum4 = _mm_add_ps(v_low, v_high);
                         __m128 v_sum2 = _mm_add_ps(v_sum4, _mm_movehl_ps(v_sum4, v_sum4));
                         __m128 v_sum1 = _mm_add_ss(v_sum2, _mm_shuffle_ps(v_sum2, v_sum2, 0x55));
@@ -1691,6 +1709,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else {
         // ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
+
         static bool graph_first_run = true;
         if (graph_first_run) {
              printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
@@ -1704,6 +1723,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         
         // 正式挂载 Sparse Attention 节点
         ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
+
         cb(kq, "kq", il);
 
         // note: this op tends to require high floating point range
