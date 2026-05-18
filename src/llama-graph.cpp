@@ -1401,20 +1401,7 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 
 static std::atomic<int64_t> g_sparse_attn_time_us(0);
 static std::atomic<int64_t> g_sparse_attn_calls(0);
-static std::atomic<int64_t> g_sparse_total_elements(0);
-static std::atomic<int64_t> g_sparse_zero_elements(0);
-static std::atomic<int64_t> g_sparse_skipped_elements(0);
 
-static std::atomic<int64_t> g_sparse_time_memset_us(0);
-static std::atomic<int64_t> g_sparse_time_compute_us(0);
-static std::atomic<int64_t> g_sparse_time_compute_prep_us(0);
-static std::atomic<int64_t> g_sparse_time_compute_math_us(0);
-static std::atomic<int64_t> g_sparse_time_scan_us(0);
-
-static std::atomic<int64_t> g_sparse_total_blocks(0);
-static std::atomic<int64_t> g_sparse_blocks_6_zeros(0);
-static std::atomic<int64_t> g_sparse_blocks_7_zeros(0);
-static std::atomic<int64_t> g_sparse_blocks_8_zeros(0);
 
 // 强制告诉 GCC 这个函数要使用 AVX2 编译
 #if defined(__GNUC__) || defined(__clang__)
@@ -1457,14 +1444,7 @@ static void sparse_attn(
     if (h_start >= n_heads) return;
 
     int64_t t_start = (ith == 0) ? ggml_time_us() : 0;
-    int64_t local_total = 0;
-    int64_t local_zeros = 0;
-    int64_t local_skipped = 0;
-    int64_t local_math_us = 0;
-    int64_t local_blocks = 0;
-    int64_t local_b6 = 0;
-    int64_t local_b7 = 0;
-    int64_t local_b8 = 0;
+
 
     // 
     const float theta = 0.4f; 
@@ -1478,14 +1458,11 @@ static void sparse_attn(
             char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
 
 
-            int64_t t_m0 = (ith == 0) ? ggml_time_us() : 0;
             for (int iq = 0; iq < n_tokens_q; iq++) {
                 memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
             }
-            if (ith == 0) g_sparse_time_memset_us += (ggml_time_us() - t_m0);
 
             // 1.  Delta K , Delta R = Q * Delta K
-            int64_t t_c0 = (ith == 0) ? ggml_time_us() : 0;
             for (int ik = 0; ik < n_tokens_k; ik++) {
                 const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
                 const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);    // k_nb1 = 256 = n_embd_h * sizeof(float)
@@ -1513,23 +1490,9 @@ static void sparse_attn(
 
                     int mask = _mm256_movemask_ps(v_mask);
                     
-                    // Count ones in 8-bit mask
-                    int ones = 0;
-                    for (int i = 0; i < 8; i++) {
-                        if (mask & (1 << i)) ones++;
-                    }
-                    
-                    local_total += 8;
-                    local_zeros += (8 - ones);
-                    local_blocks++;
-
-                    if (ones == 2) local_b6++;
-                    if (ones == 1) local_b7++;
-                    if (ones == 0) local_b8++;
 
                     // jump
                     if (mask == 0) {  // movemask 0000000, highest bit
-                        local_skipped += 8;
                         continue;
                     }
 
@@ -1567,73 +1530,29 @@ static void sparse_attn(
                         
                         *out_val += _mm_cvtss_f32(v_sum1);
                     }
-                    if (ith == 0) local_math_us += (ggml_time_us() - t_m_start);
                 }
             }
-            if (ith == 0) g_sparse_time_compute_us += (ggml_time_us() - t_c0);
 
             // 
-            int64_t t_s0 = (ith == 0) ? ggml_time_us() : 0;
             for (int iq = 0; iq < n_tokens_q; iq++) {
                 float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);   // dst[iq][0]
                 for (int ik = 1; ik < n_tokens_k; ik++) {
                     row_out[ik] += row_out[ik - 1];
                 }
             }
-            if (ith == 0) g_sparse_time_scan_us += (ggml_time_us() - t_s0);
         }
     }
 
-    g_sparse_total_elements   += local_total;
-    g_sparse_zero_elements    += local_zeros;
-    g_sparse_skipped_elements += local_skipped;
-    g_sparse_time_compute_math_us += local_math_us;
 
-    g_sparse_total_blocks    += local_blocks;
-    g_sparse_blocks_6_zeros  += local_b6;
-    g_sparse_blocks_7_zeros  += local_b7;
-    g_sparse_blocks_8_zeros  += local_b8;
 
     if (ith == 0) {
         g_sparse_attn_time_us += (ggml_time_us() - t_start);
         g_sparse_attn_calls++;
         if (g_sparse_attn_calls % 16 == 0) {
-            double total = (double)g_sparse_total_elements.load();
-            double zeros = (double)g_sparse_zero_elements.load();
-            double skips = (double)g_sparse_skipped_elements.load();
-
-            printf("\n[SparseAttn Stats] Avg time: %lld us | Sparsity: %.2f%% | Skip Rate: %.2f%% | Skip Eff: %.2f%% (theta=%.3f)\n", 
-                   (long long)(g_sparse_attn_time_us / 16), 
-                   (zeros / total) * 100.0,
-                   (skips / total) * 100.0,
-                   zeros > 0 ? (skips / zeros) * 100.0 : 0.0,
-                   theta);
-            
-            printf("  Detail: Memset: %lld us | Compute: %lld us (Prep: %lld, Math: %lld) | Scan: %lld us\n",
-                   (long long)(g_sparse_time_memset_us / 16),
-                   (long long)(g_sparse_time_compute_us / 16),
-                   (long long)((g_sparse_time_compute_us - g_sparse_time_compute_math_us) / 16),
-                   (long long)(g_sparse_time_compute_math_us / 16),
-                   (long long)(g_sparse_time_scan_us / 16));
-
-            printf("  Blocks: Total: %lld | 8-zeros: %.1f%% | 7-zeros: %.1f%% | 6-zeros: %.1f%%\n",
-                   (long long)g_sparse_total_blocks.load(),
-                   (double)g_sparse_blocks_8_zeros.load() / g_sparse_total_blocks.load() * 100.0,
-                   (double)g_sparse_blocks_7_zeros.load() / g_sparse_total_blocks.load() * 100.0,
-                   (double)g_sparse_blocks_6_zeros.load() / g_sparse_total_blocks.load() * 100.0);
+            printf("\n[SparseAttn Perf] Avg time per layer: %lld us (theta=%.3f)\n", 
+                   (long long)(g_sparse_attn_time_us / 16), theta);
 
             g_sparse_attn_time_us = 0;
-            g_sparse_time_memset_us = 0;
-            g_sparse_time_compute_us = 0;
-            g_sparse_time_compute_math_us = 0;
-            g_sparse_time_scan_us = 0;
-            g_sparse_total_elements = 0;
-            g_sparse_zero_elements = 0;
-            g_sparse_skipped_elements = 0;
-            g_sparse_total_blocks = 0;
-            g_sparse_blocks_6_zeros = 0;
-            g_sparse_blocks_7_zeros = 0;
-            g_sparse_blocks_8_zeros = 0;
         }
     }
 }
