@@ -1397,13 +1397,12 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
 }
 
 #include <atomic>
-#include <immintrin.h> // 引入 AVX/AVX2 指令集
+#include <immintrin.h> // AVX/AVX2
 
 static std::atomic<int64_t> g_sparse_attn_time_us(0);
 static std::atomic<int64_t> g_sparse_attn_calls(0);
 
 
-// 强制告诉 GCC 这个函数要使用 AVX2 编译
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx,avx2,fma")))
 #endif
@@ -1415,9 +1414,9 @@ static void sparse_attn(
         int ith, 
         int nth, 
         void * userdata) {
-    const int n_embd_h   = (int)b->ne[0];
-    const int n_tokens_q = (int)b->ne[1];
-    const int n_tokens_k = (int)c->ne[1];
+    const int n_embd_h   = (int)b->ne[0]; // dim
+    const int n_tokens_q = (int)b->ne[1]; // q_len
+    const int n_tokens_k = (int)c->ne[1]; // k_len
     const int n_heads    = (int)b->ne[2];
     const int n_heads_k  = (int)c->ne[2];
     const int n_batch    = (int)b->ne[3];
@@ -1470,7 +1469,7 @@ static void sparse_attn(
                 
                 const __m256 v_theta = _mm256_set1_ps(theta);
                 const __m256 v_abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)); // abs mask _mm256_castsi256_ps bit -> float /_mm256_set1_epi32 copy
-
+                                                                                              // 0 11111111 11111111 11111111 11111111
                 // pre scan, record the valid d
                 int valid_d[8];
                 __m256 valid_deltas[8];
@@ -1484,15 +1483,19 @@ static void sparse_attn(
                     // get delta
                     __m256 v_delta  = _mm256_sub_ps(v_k_curr, v_k_prev);
 
-                    // abs theta then compare
-                    __m256 v_abs_delta = _mm256_and_ps(v_abs_mask, v_delta);
-                    __m256 v_mask = _mm256_cmp_ps(v_abs_delta, v_theta, _CMP_GE_OQ); // _CMP_GE_OQ >=, ordered
+                    __m256 v_mask;
+                    if (ik == 0) {
+                        v_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0xFFFFFFFF)); // all 1, keep all
+                    } else {
+                        // abs theta then compare
+                        __m256 v_abs_delta = _mm256_and_ps(v_abs_mask, v_delta);
+                        v_mask = _mm256_cmp_ps(v_abs_delta, v_theta, _CMP_GE_OQ); // _CMP_GE_OQ >=
+                    }
 
-                    int mask = _mm256_movemask_ps(v_mask);
+                    int mask = _mm256_movemask_ps(v_mask); // convert 8-element SIMD mask to an 8-bit integer for quick check
                     
-
                     // jump
-                    if (mask == 0) {  // movemask 0000000, highest bit
+                    if (mask == 0) {  
                         continue;
                     }
 
@@ -1508,17 +1511,16 @@ static void sparse_attn(
                 // Before: valid_count * n_tokens_q hadds
                 // After:  n_tokens_q hadds
                 if (valid_count > 0) {
-                    int64_t t_m_start = (ith == 0) ? ggml_time_us() : 0;
                     for (int iq = 0; iq < n_tokens_q; iq++) {
                         const float * q_row = (const float *)(q_head_ptr + iq * q_nb1);
                         float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
                         
                         __m256 v_sum = _mm256_setzero_ps();
                         
-                        // fma
+                        // fma: Fused Multiply-Add
                         for (int idx = 0; idx < valid_count; idx++) {
                             __m256 v_q = _mm256_loadu_ps(q_row + valid_d[idx]);
-                            v_sum = _mm256_fmadd_ps(valid_deltas[idx], v_q, v_sum);
+                            v_sum = _mm256_fmadd_ps(valid_deltas[idx], v_q, v_sum); 
                         }
 
                         // once (hadd)
@@ -1537,7 +1539,7 @@ static void sparse_attn(
             for (int iq = 0; iq < n_tokens_q; iq++) {
                 float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);   // dst[iq][0]
                 for (int ik = 1; ik < n_tokens_k; ik++) {
-                    row_out[ik] += row_out[ik - 1];
+                    row_out[ik] += row_out[ik - 1];     // q·k[2] = q·k[1] + q·delta[2]
                 }
             }
         }
