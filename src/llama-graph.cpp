@@ -1678,6 +1678,129 @@ static void sparse_attn_by_dim(
     }
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx,avx2,fma")))
+#endif
+static void sparse_attn_by_transpose(
+        struct ggml_tensor * dst, 
+        const struct ggml_tensor * a, 
+        const struct ggml_tensor * b, // q
+        const struct ggml_tensor * c, // k
+        int ith, 
+        int nth, 
+        void * userdata) {
+    const int n_embd_h   = (int)b->ne[0]; // dim
+    const int n_tokens_q = (int)b->ne[1]; // q_len
+    const int n_tokens_k = (int)c->ne[1]; // k_len
+    const int n_heads    = (int)b->ne[2];
+    const int n_heads_k  = (int)c->ne[2];
+    const int n_batch    = (int)b->ne[3];
+
+    const size_t q_nb1 = b->nb[1];
+    const size_t q_nb2 = b->nb[2];
+    const size_t q_nb3 = b->nb[3];
+
+    const size_t k_nb1 = c->nb[1];
+    const size_t k_nb2 = c->nb[2];
+    const size_t k_nb3 = c->nb[3];
+
+    const size_t dst_nb1 = dst->nb[1];
+    const size_t dst_nb2 = dst->nb[2];
+    const size_t dst_nb3 = dst->nb[3];
+
+    const int gqa_ratio = n_heads / n_heads_k;
+
+    const int heads_per_thread = (n_heads + nth - 1) / nth;
+    const int h_start = ith * heads_per_thread;
+    const int h_end   = (h_start + heads_per_thread < n_heads) ? (h_start + heads_per_thread) : n_heads;
+
+    if (h_start >= n_heads) return;
+
+    int64_t t_start = (ith == 0) ? ggml_time_us() : 0;
+    const float theta = 0.4f; 
+
+    for (int ib = 0; ib < n_batch; ib++) {
+        for (int ih = h_start; ih < h_end; ih++) {
+            int mapped_k_head = ih / gqa_ratio;
+
+            char * q_head_ptr   = ((char *)b->data)   + ib * q_nb3 + ih * q_nb2;
+            char * k_head_ptr   = ((char *)c->data)   + ib * k_nb3 + mapped_k_head * k_nb2;
+            char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
+
+            // Local Transpose of Q matrix
+            // Size: 64 * 512 floats = 128 KB
+            float* q_transposed = new float[n_embd_h * n_tokens_q];
+            for (int iq = 0; iq < n_tokens_q; iq++) {
+                const float* q_row = (const float*)(q_head_ptr + iq * q_nb1);
+                for (int d = 0; d < n_embd_h; d++) {
+                    q_transposed[d * n_tokens_q + iq] = q_row[d];
+                }
+            }
+
+            for (int iq = 0; iq < n_tokens_q; iq++) {
+                memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
+            }
+
+            for (int ik = 0; ik < n_tokens_k; ik++) {
+                const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
+                const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);
+
+                float local_res[4096];
+                memset(local_res, 0, n_tokens_q * sizeof(float));
+
+                for (int d = 0; d < n_embd_h; d++) {
+                    float k_val = k_current[d];
+                    if (ik > 0) {
+                        float k_diff = k_val - k_previous[d];
+                        if (fabsf(k_diff) < theta) continue;
+                        k_val = k_diff;
+                    }
+
+                    __m256 v_k = _mm256_set1_ps(k_val);
+                    const float* q_col_base = q_transposed + d * n_tokens_q;
+
+                    int iq = 0;
+                    for (; iq + 7 < n_tokens_q; iq += 8) {
+                        __m256 v_q = _mm256_loadu_ps(q_col_base + iq); // Contiguous Load
+                        __m256 v_res = _mm256_loadu_ps(&local_res[iq]);
+                        v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
+                        _mm256_storeu_ps(&local_res[iq], v_res);
+                    }
+                    for (; iq < n_tokens_q; iq++) {
+                        local_res[iq] += k_val * q_col_base[iq];
+                    }
+                }
+
+                // Write back
+                for (int iq = 0; iq < n_tokens_q; iq++) {
+                    float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
+                    *out_val += local_res[iq];
+                }
+            }
+
+            delete[] q_transposed; // Clean up the local memory
+
+            // 4. Prefix Sum
+            for (int iq = 0; iq < n_tokens_q; iq++) {
+                float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);
+                for (int ik = 1; ik < n_tokens_k; ik++) {
+                    row_out[ik] += row_out[ik - 1];
+                }
+            }
+        }
+    }
+
+    if (ith == 0) {
+        g_sparse_attn_time_us += (ggml_time_us() - t_start);
+        g_sparse_attn_calls++;
+        if (g_sparse_attn_calls % 16 == 0) {
+            printf("\n[SparseAttn ByTranspose Perf] Avg time per layer: %lld us (theta=%.3f)\n", 
+                   (long long)(g_sparse_attn_time_us / 16), theta);
+            g_sparse_attn_time_us = 0;
+        }
+    }
+}
+
 static void sparse_attn(
         struct ggml_tensor * dst, 
         const struct ggml_tensor * a, 
@@ -1686,9 +1809,12 @@ static void sparse_attn(
         int ith, 
         int nth, 
         void * userdata) {
-#define SPARSE_BY_DIM 
+#define SPARSE_BY_TRANSPOSE 
+//#define SPARSE_BY_DIM 
 
-#ifdef SPARSE_BY_DIM
+#ifdef SPARSE_BY_TRANSPOSE
+    sparse_attn_by_transpose(dst, a, b, c, ith, nth, userdata);
+#elif defined(SPARSE_BY_DIM)
     sparse_attn_by_dim(dst, a, b, c, ith, nth, userdata);
 #else
     sparse_attn_by_block(dst, a, b, c, ith, nth, userdata);
