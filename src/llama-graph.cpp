@@ -1678,6 +1678,10 @@ static void sparse_attn_by_dim(
     }
 }
 
+static int64_t g_sparse_transpose_ik0_us = 0;
+static int64_t g_sparse_core_ik_us = 0;
+static int64_t g_sparse_prefix_us = 0;
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx,avx2,fma")))
 #endif
@@ -1719,6 +1723,10 @@ static void sparse_attn_by_transpose(
     int64_t t_start = (ith == 0) ? ggml_time_us() : 0;
     const float theta = 0.4f; 
 
+    int64_t t_transpose = 0;
+    int64_t t_core = 0;
+    int64_t t_prefix = 0;
+
     for (int ib = 0; ib < n_batch; ib++) {
         for (int ih = h_start; ih < h_end; ih++) {
             int mapped_k_head = ih / gqa_ratio;
@@ -1727,47 +1735,141 @@ static void sparse_attn_by_transpose(
             char * k_head_ptr   = ((char *)c->data)   + ib * k_nb3 + mapped_k_head * k_nb2;
             char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
 
-            // Local Transpose of Q matrix
-            // Size: 64 * 512 floats = 128 KB
             float* q_transposed = new float[n_embd_h * n_tokens_q];
-            for (int iq = 0; iq < n_tokens_q; iq++) {
-                const float* q_row = (const float*)(q_head_ptr + iq * q_nb1);
-                for (int d = 0; d < n_embd_h; d++) {
-                    q_transposed[d * n_tokens_q + iq] = q_row[d];
-                }
-            }
+            int stride_f = q_nb1 / sizeof(float);
+            __m256i v_indices = _mm256_set_epi32(7*stride_f, 6*stride_f, 5*stride_f, 4*stride_f, 3*stride_f, 2*stride_f, 1*stride_f, 0);
 
             for (int iq = 0; iq < n_tokens_q; iq++) {
                 memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
             }
 
-            for (int ik = 0; ik < n_tokens_k; ik++) {
-                const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
-                const float * k_previous = (ik == 0) ? nullptr : (const float *)(k_head_ptr + (ik - 1) * k_nb1);
+            int64_t t0 = (ith == 0) ? ggml_time_us() : 0;
 
+            // 1. Fused Transpose and ik=0 calculation
+            if (n_tokens_k > 0) {
+                int ik = 0;
+                const float * k_current = (const float *)(k_head_ptr + ik * k_nb1);
+                
                 float local_res[4096];
                 memset(local_res, 0, n_tokens_q * sizeof(float));
 
                 for (int d = 0; d < n_embd_h; d++) {
                     float k_val = k_current[d];
-                    if (ik > 0) {
-                        float k_diff = k_val - k_previous[d];
-                        if (fabsf(k_diff) < theta) continue;
-                        k_val = k_diff;
-                    }
-
                     __m256 v_k = _mm256_set1_ps(k_val);
-                    const float* q_col_base = q_transposed + d * n_tokens_q;
 
                     int iq = 0;
                     for (; iq + 7 < n_tokens_q; iq += 8) {
-                        __m256 v_q = _mm256_loadu_ps(q_col_base + iq); // Contiguous Load
+                        const float* base_q = (const float*)q_head_ptr + d + iq * stride_f;
+                        __m256 v_q = _mm256_i32gather_ps(base_q, v_indices, 4);
+                        
+                        // Fused Transpose Store
+                        _mm256_storeu_ps(q_transposed + d * n_tokens_q + iq, v_q);
+                        
+                        // Fused Math
+                        __m256 v_res = _mm256_loadu_ps(&local_res[iq]);
+                        v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
+                        _mm256_storeu_ps(&local_res[iq], v_res);
+                    }
+                    // Handle remaining elements (tail)
+                    for (; iq < n_tokens_q; iq++) {
+                        const float* base_q = (const float*)q_head_ptr + d + iq * stride_f;
+                        float q_val = *base_q;
+                        q_transposed[d * n_tokens_q + iq] = q_val;
+                        local_res[iq] += k_val * q_val;
+                    }
+                }
+
+                // Write back ik=0
+                for (int iq = 0; iq < n_tokens_q; iq++) {
+                    float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
+                    *out_val += local_res[iq];
+                }
+            }
+
+            int64_t t1 = (ith == 0) ? ggml_time_us() : 0;
+            if (ith == 0) t_transpose += (t1 - t0);
+
+            // 2. Core Engine: Handle ik > 0
+            for (int ik = 1; ik < n_tokens_k; ik++) {
+                const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
+                const float * k_previous = (const float *)(k_head_ptr + (ik - 1) * k_nb1);
+
+                int valid_d[64];
+                float valid_deltas[64];
+                int valid_count = 0;
+
+                __m256 v_theta = _mm256_set1_ps(theta);
+                __m256 v_neg_theta = _mm256_set1_ps(-theta);
+
+                // --- SIMD Pre-scan (Branchless Extraction) ---
+                for (int d = 0; d < n_embd_h; d += 8) {
+                    __m256 v_k_curr = _mm256_loadu_ps(k_current + d);
+                    __m256 v_k_prev = _mm256_loadu_ps(k_previous + d);
+                    __m256 v_diff = _mm256_sub_ps(v_k_curr, v_k_prev);
+                    
+                    __m256 mask_pos = _mm256_cmp_ps(v_diff, v_theta, _CMP_GE_OQ);
+                    __m256 mask_neg = _mm256_cmp_ps(v_diff, v_neg_theta, _CMP_LE_OQ);
+                    __m256 mask = _mm256_or_ps(mask_pos, mask_neg);
+                    
+                    int bitmask = _mm256_movemask_ps(mask);
+                    
+                    if (bitmask > 0) {
+                        float diff_arr[8];
+                        _mm256_storeu_ps(diff_arr, v_diff); // Safe UB-free extraction
+                        
+                        while (bitmask > 0) {
+                            int bit_idx = __builtin_ctz(bitmask); // Fast trailing zero count
+                            valid_d[valid_count] = d + bit_idx;
+                            valid_deltas[valid_count] = diff_arr[bit_idx];
+                            valid_count++;
+                            bitmask &= (bitmask - 1); // Clear lowest bit
+                        }
+                    }
+                }
+                
+                if (valid_count == 0) continue; // Skip entirely if nothing changed
+
+                float local_res[4096];
+                memset(local_res, 0, n_tokens_q * sizeof(float));
+
+                // --- Unrolled Math Engine (Branchless) ---
+                for (int v = 0; v < valid_count; v++) {
+                    int d = valid_d[v];
+                    __m256 v_k = _mm256_set1_ps(valid_deltas[v]);
+                    const float* q_col_base = q_transposed + d * n_tokens_q;
+
+                    int iq = 0;
+                    // Unroll x4 (32 elements per iteration)
+                    for (; iq + 31 < n_tokens_q; iq += 32) {
+                        __m256 v_q0 = _mm256_loadu_ps(q_col_base + iq);
+                        __m256 v_q1 = _mm256_loadu_ps(q_col_base + iq + 8);
+                        __m256 v_q2 = _mm256_loadu_ps(q_col_base + iq + 16);
+                        __m256 v_q3 = _mm256_loadu_ps(q_col_base + iq + 24);
+
+                        __m256 v_res0 = _mm256_loadu_ps(&local_res[iq]);
+                        __m256 v_res1 = _mm256_loadu_ps(&local_res[iq + 8]);
+                        __m256 v_res2 = _mm256_loadu_ps(&local_res[iq + 16]);
+                        __m256 v_res3 = _mm256_loadu_ps(&local_res[iq + 24]);
+
+                        v_res0 = _mm256_fmadd_ps(v_k, v_q0, v_res0);
+                        v_res1 = _mm256_fmadd_ps(v_k, v_q1, v_res1);
+                        v_res2 = _mm256_fmadd_ps(v_k, v_q2, v_res2);
+                        v_res3 = _mm256_fmadd_ps(v_k, v_q3, v_res3);
+
+                        _mm256_storeu_ps(&local_res[iq], v_res0);
+                        _mm256_storeu_ps(&local_res[iq + 8], v_res1);
+                        _mm256_storeu_ps(&local_res[iq + 16], v_res2);
+                        _mm256_storeu_ps(&local_res[iq + 24], v_res3);
+                    }
+                    // Tail logic
+                    for (; iq + 7 < n_tokens_q; iq += 8) {
+                        __m256 v_q = _mm256_loadu_ps(q_col_base + iq);
                         __m256 v_res = _mm256_loadu_ps(&local_res[iq]);
                         v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
                         _mm256_storeu_ps(&local_res[iq], v_res);
                     }
                     for (; iq < n_tokens_q; iq++) {
-                        local_res[iq] += k_val * q_col_base[iq];
+                        local_res[iq] += valid_deltas[v] * q_col_base[iq];
                     }
                 }
 
@@ -1778,6 +1880,9 @@ static void sparse_attn_by_transpose(
                 }
             }
 
+            int64_t t2 = (ith == 0) ? ggml_time_us() : 0;
+            if (ith == 0) t_core += (t2 - t1);
+
             delete[] q_transposed; // Clean up the local memory
 
             // 4. Prefix Sum
@@ -1787,16 +1892,30 @@ static void sparse_attn_by_transpose(
                     row_out[ik] += row_out[ik - 1];
                 }
             }
+
+            int64_t t3 = (ith == 0) ? ggml_time_us() : 0;
+            if (ith == 0) t_prefix += (t3 - t2);
         }
     }
 
     if (ith == 0) {
+        g_sparse_transpose_ik0_us += t_transpose;
+        g_sparse_core_ik_us += t_core;
+        g_sparse_prefix_us += t_prefix;
+
         g_sparse_attn_time_us += (ggml_time_us() - t_start);
         g_sparse_attn_calls++;
         if (g_sparse_attn_calls % 16 == 0) {
             printf("\n[SparseAttn ByTranspose Perf] Avg time per layer: %lld us (theta=%.3f)\n", 
                    (long long)(g_sparse_attn_time_us / 16), theta);
+            printf("    - Transpose & ik=0 : %lld us\n", (long long)(g_sparse_transpose_ik0_us / 16));
+            printf("    - Core ik>0 (Math) : %lld us\n", (long long)(g_sparse_core_ik_us / 16));
+            printf("    - Prefix Sum       : %lld us\n", (long long)(g_sparse_prefix_us / 16));
+            
             g_sparse_attn_time_us = 0;
+            g_sparse_transpose_ik0_us = 0;
+            g_sparse_core_ik_us = 0;
+            g_sparse_prefix_us = 0;
         }
     }
 }
