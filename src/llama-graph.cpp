@@ -1678,9 +1678,19 @@ static void sparse_attn_by_dim(
     }
 }
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
+
 static int64_t g_sparse_transpose_ik0_us = 0;
 static int64_t g_sparse_core_ik_us = 0;
 static int64_t g_sparse_prefix_us = 0;
+
+static uint64_t g_cycles_scan = 0;
+static uint64_t g_cycles_math = 0;
+static uint64_t g_cycles_write = 0;
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx,avx2,fma")))
@@ -1726,6 +1736,10 @@ static void sparse_attn_by_transpose(
     int64_t t_transpose = 0;
     int64_t t_core = 0;
     int64_t t_prefix = 0;
+
+    uint64_t l_cycles_scan = 0;
+    uint64_t l_cycles_math = 0;
+    uint64_t l_cycles_write = 0;
 
     for (int ib = 0; ib < n_batch; ib++) {
         for (int ih = h_start; ih < h_end; ih++) {
@@ -1790,107 +1804,179 @@ static void sparse_attn_by_transpose(
             if (ith == 0) t_transpose += (t1 - t0);
 
             // 2. Core Engine: Handle ik > 0
-            for (int ik = 1; ik < n_tokens_k; ik++) {
-                const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
-                const float * k_previous = (const float *)(k_head_ptr + (ik - 1) * k_nb1);
-
+            const int IK_BLOCK = 16;
+            
+            struct IK_Data {
                 int valid_d[64];
                 float valid_deltas[64];
-                int valid_count = 0;
+                int valid_count;
+            } ik_data[16];
+
+            for (int ik_start = 1; ik_start < n_tokens_k; ik_start += IK_BLOCK) {
+                int ik_end = (ik_start + IK_BLOCK < n_tokens_k) ? (ik_start + IK_BLOCK) : n_tokens_k;
+                int current_block_size = ik_end - ik_start;
+
+                uint64_t t0 = 0;
+                if (ith == 0) t0 = __rdtsc();
 
                 __m256 v_theta = _mm256_set1_ps(theta);
                 __m256 v_abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
 
-                // --- SIMD Pre-scan (Branchless Extraction) ---
-                for (int d = 0; d < n_embd_h; d += 8) {
-                    __m256 v_k_curr = _mm256_loadu_ps(k_current + d);
-                    __m256 v_k_prev = _mm256_loadu_ps(k_previous + d);
-                    __m256 v_diff = _mm256_sub_ps(v_k_curr, v_k_prev);
-                    
-                    __m256 v_abs_diff = _mm256_and_ps(v_diff, v_abs_mask);
-                    __m256 mask = _mm256_cmp_ps(v_abs_diff, v_theta, _CMP_GE_OQ);
-                    
-                    int bitmask = _mm256_movemask_ps(mask);
-                    
-                    if (bitmask > 0) {
-                        float diff_arr[8];
-                        _mm256_storeu_ps(diff_arr, v_diff); // Safe UB-free extraction
+                // --- 1. SIMD Pre-scan for entire block ---
+                for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                    int ik = ik_start + b_ik;
+                    const float * k_current  = (const float *)(k_head_ptr + ik * k_nb1);
+                    const float * k_previous = (const float *)(k_head_ptr + (ik - 1) * k_nb1);
+
+                    int valid_count = 0;
+                    for (int d = 0; d < n_embd_h; d += 8) {
+                        __m256 v_k_curr = _mm256_loadu_ps(k_current + d);
+                        __m256 v_k_prev = _mm256_loadu_ps(k_previous + d);
+                        __m256 v_diff = _mm256_sub_ps(v_k_curr, v_k_prev);
                         
-                        while (bitmask > 0) {
-                            int bit_idx = __builtin_ctz(bitmask); // Fast trailing zero count
-                            valid_d[valid_count] = d + bit_idx;
-                            valid_deltas[valid_count] = diff_arr[bit_idx];
-                            valid_count++;
-                            bitmask &= (bitmask - 1); // Clear lowest bit
+                        __m256 v_abs_diff = _mm256_and_ps(v_diff, v_abs_mask);
+                        __m256 mask = _mm256_cmp_ps(v_abs_diff, v_theta, _CMP_GE_OQ);
+                        
+                        int bitmask = _mm256_movemask_ps(mask);
+                        
+                        if (bitmask > 0) {
+                            float diff_arr[8];
+                            _mm256_storeu_ps(diff_arr, v_diff); // Safe UB-free extraction
+                            
+                            while (bitmask > 0) {
+                                int bit_idx = __builtin_ctz(bitmask); // Fast trailing zero count
+                                ik_data[b_ik].valid_d[valid_count] = d + bit_idx;
+                                ik_data[b_ik].valid_deltas[valid_count] = diff_arr[bit_idx];
+                                valid_count++;
+                                bitmask &= (bitmask - 1); // Clear lowest bit
+                            }
+                        }
+                    }
+                    ik_data[b_ik].valid_count = valid_count;
+                }
+                
+                if (ith == 0) {
+                    uint64_t t1 = __rdtsc();
+                    l_cycles_scan += (t1 - t0);
+                }
+
+                // --- 2. Register Blocked Math Engine with L1 Cache Tiling ---
+                int iq = 0;
+                for (; iq + 31 < n_tokens_q; iq += 32) {
+                    uint64_t tm0 = 0;
+                    if (ith == 0) tm0 = __rdtsc();
+                    
+                    float local_res[32][16] = {0}; // temporary L1 buffer for the block
+
+                    for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                        int valid_count = ik_data[b_ik].valid_count;
+                        if (valid_count == 0) continue;
+                        
+                        __m256 v_res0 = _mm256_setzero_ps(); // Accumulators in REGISTERS
+                        __m256 v_res1 = _mm256_setzero_ps();
+                        __m256 v_res2 = _mm256_setzero_ps();
+                        __m256 v_res3 = _mm256_setzero_ps();
+
+                        for (int v = 0; v < valid_count; v++) {
+                            int d = ik_data[b_ik].valid_d[v];
+                            __m256 v_k = _mm256_set1_ps(ik_data[b_ik].valid_deltas[v]);
+                            const float* q_col_base = q_transposed + d * n_tokens_q;
+
+                            __m256 v_q0 = _mm256_loadu_ps(q_col_base + iq);
+                            __m256 v_q1 = _mm256_loadu_ps(q_col_base + iq + 8);
+                            __m256 v_q2 = _mm256_loadu_ps(q_col_base + iq + 16);
+                            __m256 v_q3 = _mm256_loadu_ps(q_col_base + iq + 24);
+
+                            v_res0 = _mm256_fmadd_ps(v_k, v_q0, v_res0);
+                            v_res1 = _mm256_fmadd_ps(v_k, v_q1, v_res1);
+                            v_res2 = _mm256_fmadd_ps(v_k, v_q2, v_res2);
+                            v_res3 = _mm256_fmadd_ps(v_k, v_q3, v_res3);
+                        }
+
+                        float tmp[32];
+                        _mm256_storeu_ps(&tmp[0], v_res0);
+                        _mm256_storeu_ps(&tmp[8], v_res1);
+                        _mm256_storeu_ps(&tmp[16], v_res2);
+                        _mm256_storeu_ps(&tmp[24], v_res3);
+
+                        for (int i = 0; i < 32; i++) {
+                            local_res[i][b_ik] = tmp[i];
+                        }
+                    }
+
+                    if (ith == 0) {
+                        uint64_t tm1 = __rdtsc();
+                        l_cycles_math += (tm1 - tm0);
+                    }
+                    
+                    // Contiguous write block
+                    uint64_t tm_w0 = 0;
+                    if (ith == 0) tm_w0 = __rdtsc();
+
+                    for (int i = 0; i < 32; i++) {
+                        float * dst_row = (float *)(dst_head_ptr + (iq + i) * dst_nb1);
+                        for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                            dst_row[ik_start + b_ik] += local_res[i][b_ik];
+                        }
+                    }
+                    
+                    if (ith == 0) {
+                        uint64_t tm_w1 = __rdtsc();
+                        l_cycles_write += (tm_w1 - tm_w0);
+                    }
+                }
+
+                // Tail logic 1 (Step by 8)
+                for (; iq + 7 < n_tokens_q; iq += 8) {
+                    float local_res_tail[8][16] = {0};
+
+                    for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                        int valid_count = ik_data[b_ik].valid_count;
+                        if (valid_count == 0) continue;
+                        
+                        __m256 v_res = _mm256_setzero_ps();
+                        for (int v = 0; v < valid_count; v++) {
+                            int d = ik_data[b_ik].valid_d[v];
+                            __m256 v_k = _mm256_set1_ps(ik_data[b_ik].valid_deltas[v]);
+                            const float* q_col_base = q_transposed + d * n_tokens_q;
+                            __m256 v_q = _mm256_loadu_ps(q_col_base + iq);
+                            v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
+                        }
+                        float tmp[8];
+                        _mm256_storeu_ps(tmp, v_res);
+                        for (int i = 0; i < 8; i++) {
+                            local_res_tail[i][b_ik] = tmp[i];
+                        }
+                    }
+
+                    for (int i = 0; i < 8; i++) {
+                        float * dst_row = (float *)(dst_head_ptr + (iq + i) * dst_nb1);
+                        for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                            dst_row[ik_start + b_ik] += local_res_tail[i][b_ik];
                         }
                     }
                 }
-                
-                if (valid_count == 0) continue; // Skip entirely if nothing changed
 
-                // --- Register Blocked Math Engine (Branchless) ---
-                // Outer loop over iq (Step by 32)
-                int iq = 0;
-                for (; iq + 31 < n_tokens_q; iq += 32) {
-                    __m256 v_res0 = _mm256_setzero_ps(); // Accumulators in REGISTERS
-                    __m256 v_res1 = _mm256_setzero_ps();
-                    __m256 v_res2 = _mm256_setzero_ps();
-                    __m256 v_res3 = _mm256_setzero_ps();
-
-                    // Inner loop over d
-                    for (int v = 0; v < valid_count; v++) {
-                        int d = valid_d[v];
-                        __m256 v_k = _mm256_set1_ps(valid_deltas[v]);
-                        const float* q_col_base = q_transposed + d * n_tokens_q;
-
-                        __m256 v_q0 = _mm256_loadu_ps(q_col_base + iq);
-                        __m256 v_q1 = _mm256_loadu_ps(q_col_base + iq + 8);
-                        __m256 v_q2 = _mm256_loadu_ps(q_col_base + iq + 16);
-                        __m256 v_q3 = _mm256_loadu_ps(q_col_base + iq + 24);
-
-                        v_res0 = _mm256_fmadd_ps(v_k, v_q0, v_res0);
-                        v_res1 = _mm256_fmadd_ps(v_k, v_q1, v_res1);
-                        v_res2 = _mm256_fmadd_ps(v_k, v_q2, v_res2);
-                        v_res3 = _mm256_fmadd_ps(v_k, v_q3, v_res3);
-                    }
-
-                    // Flush registers to memory once
-                    float tmp[32];
-                    _mm256_storeu_ps(&tmp[0], v_res0);
-                    _mm256_storeu_ps(&tmp[8], v_res1);
-                    _mm256_storeu_ps(&tmp[16], v_res2);
-                    _mm256_storeu_ps(&tmp[24], v_res3);
-                    for (int i = 0; i < 32; i++) {
-                        float * out_val = (float *)(dst_head_ptr + (iq + i) * dst_nb1) + ik;
-                        *out_val += tmp[i];
-                    }
-                }
-                // Tail logic 1 (Step by 8)
-                for (; iq + 7 < n_tokens_q; iq += 8) {
-                    __m256 v_res = _mm256_setzero_ps();
-                    for (int v = 0; v < valid_count; v++) {
-                        int d = valid_d[v];
-                        __m256 v_k = _mm256_set1_ps(valid_deltas[v]);
-                        const float* q_col_base = q_transposed + d * n_tokens_q;
-                        __m256 v_q = _mm256_loadu_ps(q_col_base + iq);
-                        v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
-                    }
-                    float tmp[8];
-                    _mm256_storeu_ps(tmp, v_res);
-                    for (int i = 0; i < 8; i++) {
-                        float * out_val = (float *)(dst_head_ptr + (iq + i) * dst_nb1) + ik;
-                        *out_val += tmp[i];
-                    }
-                }
                 // Tail logic 2 (Scalars)
                 for (; iq < n_tokens_q; iq++) {
-                    float res = 0;
-                    for (int v = 0; v < valid_count; v++) {
-                        int d = valid_d[v];
-                        res += valid_deltas[v] * q_transposed[d * n_tokens_q + iq];
+                    float local_res_tail_s[16] = {0};
+
+                    for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                        int valid_count = ik_data[b_ik].valid_count;
+                        if (valid_count == 0) continue;
+                        
+                        float res = 0;
+                        for (int v = 0; v < valid_count; v++) {
+                            int d = ik_data[b_ik].valid_d[v];
+                            res += ik_data[b_ik].valid_deltas[v] * q_transposed[d * n_tokens_q + iq];
+                        }
+                        local_res_tail_s[b_ik] = res;
                     }
-                    float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
-                    *out_val += res;
+
+                    float * dst_row = (float *)(dst_head_ptr + iq * dst_nb1);
+                    for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
+                        dst_row[ik_start + b_ik] += local_res_tail_s[b_ik];
+                    }
                 }
             }
 
@@ -1916,6 +2002,10 @@ static void sparse_attn_by_transpose(
         g_sparse_transpose_ik0_us += t_transpose;
         g_sparse_core_ik_us += t_core;
         g_sparse_prefix_us += t_prefix;
+        
+        g_cycles_scan += l_cycles_scan;
+        g_cycles_math += l_cycles_math;
+        g_cycles_write += l_cycles_write;
 
         g_sparse_attn_time_us += (ggml_time_us() - t_start);
         g_sparse_attn_calls++;
@@ -1926,10 +2016,21 @@ static void sparse_attn_by_transpose(
             printf("    - Core ik>0 (Math) : %lld us\n", (long long)(g_sparse_core_ik_us / 16));
             printf("    - Prefix Sum       : %lld us\n", (long long)(g_sparse_prefix_us / 16));
             
+            uint64_t total_cycles = g_cycles_scan + g_cycles_math + g_cycles_write;
+            if (total_cycles > 0) {
+                printf("  [RDTSC Cycles Profile]\n");
+                printf("    - Scan  : %llu cycles (%.1f%%)\n", g_cycles_scan / 16,  (double)g_cycles_scan  / total_cycles * 100.0);
+                printf("    - Math  : %llu cycles (%.1f%%)\n", g_cycles_math / 16,  (double)g_cycles_math  / total_cycles * 100.0);
+                printf("    - Write : %llu cycles (%.1f%%)\n", g_cycles_write / 16, (double)g_cycles_write / total_cycles * 100.0);
+            }
+            
             g_sparse_attn_time_us = 0;
             g_sparse_transpose_ik0_us = 0;
             g_sparse_core_ik_us = 0;
             g_sparse_prefix_us = 0;
+            g_cycles_scan = 0;
+            g_cycles_math = 0;
+            g_cycles_write = 0;
         }
     }
 }
@@ -2023,22 +2124,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        // ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
 
-        // static bool graph_first_run = true;
-        // if (graph_first_run) {
-        //      printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
-        //      graph_first_run = false;
-        // }
+        static bool graph_first_run = true;
+        if (graph_first_run) {
+             printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
+             graph_first_run = false;
+        }
 
-        // // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
-        // ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
-        // ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
-        // ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
+        // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
+        ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+        ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
         
-        // // 正式挂载 Sparse Attention 节点
-        // ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
+        // 正式挂载 Sparse Attention 节点
+        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
 
         cb(kq, "kq", il);
 
