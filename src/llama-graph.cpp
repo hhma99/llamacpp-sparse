@@ -1684,12 +1684,24 @@ static void sparse_attn_by_dim(
 #include <x86intrin.h>
 #endif
 
+#define GGML_PROFILE_SPARSE_ATTN 1
+
+#if GGML_PROFILE_SPARSE_ATTN
 static int64_t g_sparse_transpose_ik0_us = 0;
 static int64_t g_sparse_core_ik_us = 0;
 
 static uint64_t g_cycles_scan = 0;
 static uint64_t g_cycles_math = 0;
 static uint64_t g_cycles_write = 0;
+
+static uint64_t g_inner_loop_cycles = 0;
+static uint64_t g_inner_loop_iterations = 0;
+
+static uint64_t g_local_res_cycles = 0;
+static uint64_t g_local_res_iterations = 0;
+
+
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx,avx2,fma")))
@@ -1732,12 +1744,14 @@ static void sparse_attn_by_transpose(
     int64_t t_start = (ith == 0) ? ggml_time_us() : 0;
     const float theta = 0.6f; 
 
+#if GGML_PROFILE_SPARSE_ATTN
     int64_t t_transpose = 0;
     int64_t t_core = 0;
 
     uint64_t l_cycles_scan = 0;
     uint64_t l_cycles_math = 0;
     uint64_t l_cycles_write = 0;
+#endif
 
     for (int ib = 0; ib < n_batch; ib++) {
         for (int ih = h_start; ih < h_end; ih++) {
@@ -1756,7 +1770,9 @@ static void sparse_attn_by_transpose(
             int stride_f = q_nb1 / sizeof(float);
             __m256i v_indices = _mm256_set_epi32(7*stride_f, 6*stride_f, 5*stride_f, 4*stride_f, 3*stride_f, 2*stride_f, 1*stride_f, 0);
 
+#if GGML_PROFILE_SPARSE_ATTN
             int64_t t0 = (ith == 0) ? ggml_time_us() : 0;
+#endif
 
             // 1. Fused Transpose and ik=0 calculation
             if (n_tokens_k > 0) {
@@ -1803,14 +1819,16 @@ static void sparse_attn_by_transpose(
                 }
             }
 
+#if GGML_PROFILE_SPARSE_ATTN
             int64_t t1 = (ith == 0) ? ggml_time_us() : 0;
             if (ith == 0) t_transpose += (t1 - t0);
+#endif
 
             // 2. Core Engine: Handle ik > 0
             const int IK_BLOCK = 16;
             
             struct IK_Data {
-                int valid_d[128];
+                int valid_offset[128];
                 float valid_deltas[128];
                 int valid_count;
             } ik_data[16];
@@ -1819,8 +1837,10 @@ static void sparse_attn_by_transpose(
                 int ik_end = (ik_start + IK_BLOCK < n_tokens_k) ? (ik_start + IK_BLOCK) : n_tokens_k;
                 int current_block_size = ik_end - ik_start;
 
+#if GGML_PROFILE_SPARSE_ATTN
                 uint64_t t0 = 0;
                 if (ith == 0) t0 = __rdtsc();
+#endif
 
                 __m256 v_theta = _mm256_set1_ps(theta);
                 __m256 v_abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
@@ -1849,7 +1869,7 @@ static void sparse_attn_by_transpose(
                             
                             while (bitmask > 0) {
                                 int bit_idx = __builtin_ctz(bitmask); // Fast trailing zero count
-                                ik_data[b_ik].valid_d[valid_count] = d + bit_idx;
+                                ik_data[b_ik].valid_offset[valid_count] = (d + bit_idx) * n_tokens_q;
                                 ik_data[b_ik].valid_deltas[valid_count] = diff_arr[bit_idx];
                                 valid_count++;
                                 bitmask &= (bitmask - 1); // Clear lowest bit
@@ -1859,7 +1879,7 @@ static void sparse_attn_by_transpose(
                     for (; d < n_embd_h; d++) {
                         float diff = k_current[d] - k_previous[d];
                         if (fabs(diff) >= theta) {
-                            ik_data[b_ik].valid_d[valid_count] = d;
+                            ik_data[b_ik].valid_offset[valid_count] = d * n_tokens_q;
                             ik_data[b_ik].valid_deltas[valid_count] = diff;
                             valid_count++;
                         }
@@ -1867,14 +1887,18 @@ static void sparse_attn_by_transpose(
                     ik_data[b_ik].valid_count = valid_count;
                 }
                 
+#if GGML_PROFILE_SPARSE_ATTN
                 if (ith == 0) {
                     uint64_t t1 = __rdtsc();
                     l_cycles_scan += (t1 - t0);
                 }
+#endif
 
                 // --- 2. Register Blocked Math Engine with L1 Cache Tiling ---
                 int iq = 0;
                 for (; iq + 31 < n_tokens_q; iq += 32) {
+#define ENABLE_PREFETCH 1
+#if ENABLE_PREFETCH
                     int next_iq = iq + 32;
                     if (next_iq < n_tokens_q) {
                         for (int d_pf = 0; d_pf < n_embd_h; d_pf++) {
@@ -1882,9 +1906,12 @@ static void sparse_attn_by_transpose(
                             _mm_prefetch((const char*)(q_transposed + d_pf * n_tokens_q + next_iq + 16), _MM_HINT_T0);
                         }
                     }
+#endif
                     
+#if GGML_PROFILE_SPARSE_ATTN
                     uint64_t tm0 = 0;
                     if (ith == 0) tm0 = __rdtsc();
+#endif
                     
                     float local_res[32][16] = {0}; // temporary L1 buffer for the block
 
@@ -1897,10 +1924,15 @@ static void sparse_attn_by_transpose(
                         __m256 v_res2 = _mm256_setzero_ps();
                         __m256 v_res3 = _mm256_setzero_ps();
 
+#if GGML_PROFILE_SPARSE_ATTN
+                        uint64_t t_inner_start = 0;
+                        if (ith == 0) t_inner_start = __rdtsc();
+#endif
+
                         for (int v = 0; v < valid_count; v++) {
-                            int d = ik_data[b_ik].valid_d[v];
+                            int offset = ik_data[b_ik].valid_offset[v];
                             __m256 v_k = _mm256_set1_ps(ik_data[b_ik].valid_deltas[v]);
-                            const float* q_col_base = q_transposed + d * n_tokens_q;
+                            const float* q_col_base = q_transposed + offset;
 
                             __m256 v_q0 = _mm256_loadu_ps(q_col_base + iq);
                             __m256 v_q1 = _mm256_loadu_ps(q_col_base + iq + 8);
@@ -1913,27 +1945,57 @@ static void sparse_attn_by_transpose(
                             v_res3 = _mm256_fmadd_ps(v_k, v_q3, v_res3);
                         }
 
+#if GGML_PROFILE_SPARSE_ATTN
+                        if (ith == 0) {
+                            uint64_t t_inner_end = __rdtsc();
+                            g_inner_loop_cycles += (t_inner_end - t_inner_start);
+                            g_inner_loop_iterations += valid_count;
+                        }
+#endif
+
                         float tmp[32];
                         _mm256_storeu_ps(&tmp[0], v_res0);
                         _mm256_storeu_ps(&tmp[8], v_res1);
                         _mm256_storeu_ps(&tmp[16], v_res2);
                         _mm256_storeu_ps(&tmp[24], v_res3);
 
+#if GGML_PROFILE_SPARSE_ATTN
+                        uint64_t t_lres_start = 0;
+                        if (ith == 0) t_lres_start = __rdtsc();
+#endif
+
                         for (int i = 0; i < 32; i++) {
                             local_res[i][b_ik] = tmp[i];
                         }
+
+#if GGML_PROFILE_SPARSE_ATTN
+                        if (ith == 0) {
+                            uint64_t t_lres_end = __rdtsc();
+                            g_local_res_cycles += (t_lres_end - t_lres_start);
+                            g_local_res_iterations += 32;
+                        }
+#endif
                     }
 
+#if GGML_PROFILE_SPARSE_ATTN
                     if (ith == 0) {
                         uint64_t tm1 = __rdtsc();
                         l_cycles_math += (tm1 - tm0);
                     }
+#endif
                     
                     // Contiguous write block
+#if GGML_PROFILE_SPARSE_ATTN
                     uint64_t tm_w0 = 0;
                     if (ith == 0) tm_w0 = __rdtsc();
+#endif
 
                     for (int i = 0; i < 32; i++) {
+#if ENABLE_PREFETCH
+                        if (iq + i + 2 < n_tokens_q) {
+                            _mm_prefetch((const char*)(dst_head_ptr + (iq + i + 2) * dst_nb1 + ik_start), _MM_HINT_T0);
+                        }
+#endif
                         float * dst_row = (float *)(dst_head_ptr + (iq + i) * dst_nb1);
                         float current_acc = dst_row[ik_start - 1];
                         for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
@@ -1942,10 +2004,12 @@ static void sparse_attn_by_transpose(
                         }
                     }
                     
+#if GGML_PROFILE_SPARSE_ATTN
                     if (ith == 0) {
                         uint64_t tm_w1 = __rdtsc();
                         l_cycles_write += (tm_w1 - tm_w0);
                     }
+#endif
                 }
 
                 // Tail logic 1 (Step by 8)
@@ -1958,9 +2022,9 @@ static void sparse_attn_by_transpose(
                         
                         __m256 v_res = _mm256_setzero_ps();
                         for (int v = 0; v < valid_count; v++) {
-                            int d = ik_data[b_ik].valid_d[v];
+                            int offset = ik_data[b_ik].valid_offset[v];
                             __m256 v_k = _mm256_set1_ps(ik_data[b_ik].valid_deltas[v]);
-                            const float* q_col_base = q_transposed + d * n_tokens_q;
+                            const float* q_col_base = q_transposed + offset;
                             __m256 v_q = _mm256_loadu_ps(q_col_base + iq);
                             v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
                         }
@@ -1972,6 +2036,11 @@ static void sparse_attn_by_transpose(
                     }
 
                     for (int i = 0; i < 8; i++) {
+#if ENABLE_PREFETCH
+                        if (iq + i + 2 < n_tokens_q) {
+                            _mm_prefetch((const char*)(dst_head_ptr + (iq + i + 2) * dst_nb1 + ik_start), _MM_HINT_T0);
+                        }
+#endif
                         float * dst_row = (float *)(dst_head_ptr + (iq + i) * dst_nb1);
                         float current_acc = dst_row[ik_start - 1];
                         for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
@@ -1983,6 +2052,11 @@ static void sparse_attn_by_transpose(
 
                 // Tail logic 2 (Scalars)
                 for (; iq < n_tokens_q; iq++) {
+#if ENABLE_PREFETCH
+                    if (iq + 2 < n_tokens_q) {
+                        _mm_prefetch((const char*)(dst_head_ptr + (iq + 2) * dst_nb1 + ik_start), _MM_HINT_T0);
+                    }
+#endif
                     float local_res_tail_s[16] = {0};
 
                     for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
@@ -1991,8 +2065,8 @@ static void sparse_attn_by_transpose(
                         
                         float res = 0;
                         for (int v = 0; v < valid_count; v++) {
-                            int d = ik_data[b_ik].valid_d[v];
-                            res += ik_data[b_ik].valid_deltas[v] * q_transposed[d * n_tokens_q + iq];
+                            int offset = ik_data[b_ik].valid_offset[v];
+                            res += ik_data[b_ik].valid_deltas[v] * q_transposed[offset + iq];
                         }
                         local_res_tail_s[b_ik] = res;
                     }
@@ -2006,24 +2080,29 @@ static void sparse_attn_by_transpose(
                 }
             }
 
+#if GGML_PROFILE_SPARSE_ATTN
             int64_t t2 = (ith == 0) ? ggml_time_us() : 0;
             if (ith == 0) t_core += (t2 - t1);
+#endif
         }
     }
 
     if (ith == 0) {
+#if GGML_PROFILE_SPARSE_ATTN
         g_sparse_transpose_ik0_us += t_transpose;
         g_sparse_core_ik_us += t_core;
         
         g_cycles_scan += l_cycles_scan;
         g_cycles_math += l_cycles_math;
         g_cycles_write += l_cycles_write;
+#endif
 
         g_sparse_attn_time_us += (ggml_time_us() - t_start);
         g_sparse_attn_calls++;
         if (g_sparse_attn_calls % 16 == 0) {
             printf("\n[SparseAttn ByTranspose Perf] Avg time per layer: %lld us (theta=%.3f)\n", 
                    (long long)(g_sparse_attn_time_us / 16), theta);
+#if GGML_PROFILE_SPARSE_ATTN
             printf("    - Transpose & ik=0 : %lld us\n", (long long)(g_sparse_transpose_ik0_us / 16));
             printf("    - Core ik>0 (Math) : %lld us\n", (long long)(g_sparse_core_ik_us / 16));
             
@@ -2033,14 +2112,35 @@ static void sparse_attn_by_transpose(
                 printf("    - Scan  : %llu cycles (%.1f%%)\n", g_cycles_scan / 16,  (double)g_cycles_scan  / total_cycles * 100.0);
                 printf("    - Math  : %llu cycles (%.1f%%)\n", g_cycles_math / 16,  (double)g_cycles_math  / total_cycles * 100.0);
                 printf("    - Write : %llu cycles (%.1f%%)\n", g_cycles_write / 16, (double)g_cycles_write / total_cycles * 100.0);
+                
+                if (g_inner_loop_iterations > 0) {
+                    double cycles_per_iter = (double)g_inner_loop_cycles / g_inner_loop_iterations;
+                    printf("  [Empirical L1 Cache Validation - Q Matrix]\n");
+                    printf("    - Avg cycles per inner loop iteration: %.2f cycles\n", cycles_per_iter);
+                }
+                if (g_local_res_iterations > 0) {
+                    double cycles_per_store = (double)g_local_res_cycles / g_local_res_iterations;
+                    printf("  [Empirical L1 Cache Validation - local_res]\n");
+                    printf("    - Avg cycles per local_res float write: %.2f cycles\n", cycles_per_store);
+                    if (cycles_per_store <= 2.0) {
+                        printf("    - Verdict: SUCCESS (local_res is perfectly hitting L1 Cache!)\n");
+                    } else {
+                        printf("    - Verdict: FAILED (local_res is spilling out of L1...)\n");
+                    }
+                }
             }
             
-            g_sparse_attn_time_us = 0;
             g_sparse_transpose_ik0_us = 0;
             g_sparse_core_ik_us = 0;
             g_cycles_scan = 0;
             g_cycles_math = 0;
             g_cycles_write = 0;
+            g_inner_loop_cycles = 0;
+            g_inner_loop_iterations = 0;
+            g_local_res_cycles = 0;
+            g_local_res_iterations = 0;
+#endif
+            g_sparse_attn_time_us = 0;
         }
     }
 }
@@ -2144,12 +2244,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
-        ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
-        ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+        // ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        // ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
         ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
         
         // 正式挂载 Sparse Attention 节点
-        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
+        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q, k, sparse_attn, GGML_N_TASKS_MAX, nullptr);
 
         cb(kq, "kq", il);
 
