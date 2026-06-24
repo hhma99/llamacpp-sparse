@@ -1686,7 +1686,6 @@ static void sparse_attn_by_dim(
 
 static int64_t g_sparse_transpose_ik0_us = 0;
 static int64_t g_sparse_core_ik_us = 0;
-static int64_t g_sparse_prefix_us = 0;
 
 static uint64_t g_cycles_scan = 0;
 static uint64_t g_cycles_math = 0;
@@ -1731,11 +1730,10 @@ static void sparse_attn_by_transpose(
     if (h_start >= n_heads) return;
 
     int64_t t_start = (ith == 0) ? ggml_time_us() : 0;
-    const float theta = 0.4f; 
+    const float theta = 0.6f; 
 
     int64_t t_transpose = 0;
     int64_t t_core = 0;
-    int64_t t_prefix = 0;
 
     uint64_t l_cycles_scan = 0;
     uint64_t l_cycles_math = 0;
@@ -1749,13 +1747,14 @@ static void sparse_attn_by_transpose(
             char * k_head_ptr   = ((char *)c->data)   + ib * k_nb3 + mapped_k_head * k_nb2;
             char * dst_head_ptr = ((char *)dst->data) + ib * dst_nb3 + ih * dst_nb2;
 
-            float* q_transposed = new float[n_embd_h * n_tokens_q];
+            thread_local std::vector<float> tls_q_buffer;
+            if (tls_q_buffer.size() < (size_t)(n_embd_h * n_tokens_q)) {
+                tls_q_buffer.resize(n_embd_h * n_tokens_q);
+            }
+            float* q_transposed = tls_q_buffer.data();
+
             int stride_f = q_nb1 / sizeof(float);
             __m256i v_indices = _mm256_set_epi32(7*stride_f, 6*stride_f, 5*stride_f, 4*stride_f, 3*stride_f, 2*stride_f, 1*stride_f, 0);
-
-            for (int iq = 0; iq < n_tokens_q; iq++) {
-                memset(dst_head_ptr + iq * dst_nb1, 0, n_tokens_k * sizeof(float));
-            }
 
             int64_t t0 = (ith == 0) ? ggml_time_us() : 0;
 
@@ -1764,7 +1763,11 @@ static void sparse_attn_by_transpose(
                 int ik = 0;
                 const float * k_current = (const float *)(k_head_ptr + ik * k_nb1);
                 
-                float local_res[4096];
+                thread_local std::vector<float> tls_ik0_buffer;
+                if (tls_ik0_buffer.size() < (size_t)n_tokens_q) {
+                    tls_ik0_buffer.resize(n_tokens_q);
+                }
+                float* local_res = tls_ik0_buffer.data();
                 memset(local_res, 0, n_tokens_q * sizeof(float));
 
                 for (int d = 0; d < n_embd_h; d++) {
@@ -1807,8 +1810,8 @@ static void sparse_attn_by_transpose(
             const int IK_BLOCK = 16;
             
             struct IK_Data {
-                int valid_d[64];
-                float valid_deltas[64];
+                int valid_d[128];
+                float valid_deltas[128];
                 int valid_count;
             } ik_data[16];
 
@@ -1829,7 +1832,8 @@ static void sparse_attn_by_transpose(
                     const float * k_previous = (const float *)(k_head_ptr + (ik - 1) * k_nb1);
 
                     int valid_count = 0;
-                    for (int d = 0; d < n_embd_h; d += 8) {
+                    int d = 0;
+                    for (; d + 7 < n_embd_h; d += 8) {
                         __m256 v_k_curr = _mm256_loadu_ps(k_current + d);
                         __m256 v_k_prev = _mm256_loadu_ps(k_previous + d);
                         __m256 v_diff = _mm256_sub_ps(v_k_curr, v_k_prev);
@@ -1852,6 +1856,14 @@ static void sparse_attn_by_transpose(
                             }
                         }
                     }
+                    for (; d < n_embd_h; d++) {
+                        float diff = k_current[d] - k_previous[d];
+                        if (fabs(diff) >= theta) {
+                            ik_data[b_ik].valid_d[valid_count] = d;
+                            ik_data[b_ik].valid_deltas[valid_count] = diff;
+                            valid_count++;
+                        }
+                    }
                     ik_data[b_ik].valid_count = valid_count;
                 }
                 
@@ -1863,6 +1875,14 @@ static void sparse_attn_by_transpose(
                 // --- 2. Register Blocked Math Engine with L1 Cache Tiling ---
                 int iq = 0;
                 for (; iq + 31 < n_tokens_q; iq += 32) {
+                    int next_iq = iq + 32;
+                    if (next_iq < n_tokens_q) {
+                        for (int d_pf = 0; d_pf < n_embd_h; d_pf++) {
+                            _mm_prefetch((const char*)(q_transposed + d_pf * n_tokens_q + next_iq), _MM_HINT_T0);
+                            _mm_prefetch((const char*)(q_transposed + d_pf * n_tokens_q + next_iq + 16), _MM_HINT_T0);
+                        }
+                    }
+                    
                     uint64_t tm0 = 0;
                     if (ith == 0) tm0 = __rdtsc();
                     
@@ -1915,8 +1935,10 @@ static void sparse_attn_by_transpose(
 
                     for (int i = 0; i < 32; i++) {
                         float * dst_row = (float *)(dst_head_ptr + (iq + i) * dst_nb1);
+                        float current_acc = dst_row[ik_start - 1];
                         for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
-                            dst_row[ik_start + b_ik] += local_res[i][b_ik];
+                            current_acc += local_res[i][b_ik];
+                            dst_row[ik_start + b_ik] = current_acc;
                         }
                     }
                     
@@ -1951,8 +1973,10 @@ static void sparse_attn_by_transpose(
 
                     for (int i = 0; i < 8; i++) {
                         float * dst_row = (float *)(dst_head_ptr + (iq + i) * dst_nb1);
+                        float current_acc = dst_row[ik_start - 1];
                         for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
-                            dst_row[ik_start + b_ik] += local_res_tail[i][b_ik];
+                            current_acc += local_res_tail[i][b_ik];
+                            dst_row[ik_start + b_ik] = current_acc;
                         }
                     }
                 }
@@ -1974,34 +1998,22 @@ static void sparse_attn_by_transpose(
                     }
 
                     float * dst_row = (float *)(dst_head_ptr + iq * dst_nb1);
+                    float current_acc = dst_row[ik_start - 1];
                     for (int b_ik = 0; b_ik < current_block_size; b_ik++) {
-                        dst_row[ik_start + b_ik] += local_res_tail_s[b_ik];
+                        current_acc += local_res_tail_s[b_ik];
+                        dst_row[ik_start + b_ik] = current_acc;
                     }
                 }
             }
 
             int64_t t2 = (ith == 0) ? ggml_time_us() : 0;
             if (ith == 0) t_core += (t2 - t1);
-
-            delete[] q_transposed; // Clean up the local memory
-
-            // 4. Prefix Sum
-            for (int iq = 0; iq < n_tokens_q; iq++) {
-                float * row_out = (float *)(dst_head_ptr + iq * dst_nb1);
-                for (int ik = 1; ik < n_tokens_k; ik++) {
-                    row_out[ik] += row_out[ik - 1];
-                }
-            }
-
-            int64_t t3 = (ith == 0) ? ggml_time_us() : 0;
-            if (ith == 0) t_prefix += (t3 - t2);
         }
     }
 
     if (ith == 0) {
         g_sparse_transpose_ik0_us += t_transpose;
         g_sparse_core_ik_us += t_core;
-        g_sparse_prefix_us += t_prefix;
         
         g_cycles_scan += l_cycles_scan;
         g_cycles_math += l_cycles_math;
@@ -2014,7 +2026,6 @@ static void sparse_attn_by_transpose(
                    (long long)(g_sparse_attn_time_us / 16), theta);
             printf("    - Transpose & ik=0 : %lld us\n", (long long)(g_sparse_transpose_ik0_us / 16));
             printf("    - Core ik>0 (Math) : %lld us\n", (long long)(g_sparse_core_ik_us / 16));
-            printf("    - Prefix Sum       : %lld us\n", (long long)(g_sparse_prefix_us / 16));
             
             uint64_t total_cycles = g_cycles_scan + g_cycles_math + g_cycles_write;
             if (total_cycles > 0) {
@@ -2027,7 +2038,6 @@ static void sparse_attn_by_transpose(
             g_sparse_attn_time_us = 0;
             g_sparse_transpose_ik0_us = 0;
             g_sparse_core_ik_us = 0;
-            g_sparse_prefix_us = 0;
             g_cycles_scan = 0;
             g_cycles_math = 0;
             g_cycles_write = 0;
