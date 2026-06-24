@@ -1799,7 +1799,7 @@ static void sparse_attn_by_transpose(
                 int valid_count = 0;
 
                 __m256 v_theta = _mm256_set1_ps(theta);
-                __m256 v_neg_theta = _mm256_set1_ps(-theta);
+                __m256 v_abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
 
                 // --- SIMD Pre-scan (Branchless Extraction) ---
                 for (int d = 0; d < n_embd_h; d += 8) {
@@ -1807,9 +1807,8 @@ static void sparse_attn_by_transpose(
                     __m256 v_k_prev = _mm256_loadu_ps(k_previous + d);
                     __m256 v_diff = _mm256_sub_ps(v_k_curr, v_k_prev);
                     
-                    __m256 mask_pos = _mm256_cmp_ps(v_diff, v_theta, _CMP_GE_OQ);
-                    __m256 mask_neg = _mm256_cmp_ps(v_diff, v_neg_theta, _CMP_LE_OQ);
-                    __m256 mask = _mm256_or_ps(mask_pos, mask_neg);
+                    __m256 v_abs_diff = _mm256_and_ps(v_diff, v_abs_mask);
+                    __m256 mask = _mm256_cmp_ps(v_abs_diff, v_theta, _CMP_GE_OQ);
                     
                     int bitmask = _mm256_movemask_ps(mask);
                     
@@ -1829,54 +1828,69 @@ static void sparse_attn_by_transpose(
                 
                 if (valid_count == 0) continue; // Skip entirely if nothing changed
 
-                float local_res[4096];
-                memset(local_res, 0, n_tokens_q * sizeof(float));
+                // --- Register Blocked Math Engine (Branchless) ---
+                // Outer loop over iq (Step by 32)
+                int iq = 0;
+                for (; iq + 31 < n_tokens_q; iq += 32) {
+                    __m256 v_res0 = _mm256_setzero_ps(); // Accumulators in REGISTERS
+                    __m256 v_res1 = _mm256_setzero_ps();
+                    __m256 v_res2 = _mm256_setzero_ps();
+                    __m256 v_res3 = _mm256_setzero_ps();
 
-                // --- Unrolled Math Engine (Branchless) ---
-                for (int v = 0; v < valid_count; v++) {
-                    int d = valid_d[v];
-                    __m256 v_k = _mm256_set1_ps(valid_deltas[v]);
-                    const float* q_col_base = q_transposed + d * n_tokens_q;
+                    // Inner loop over d
+                    for (int v = 0; v < valid_count; v++) {
+                        int d = valid_d[v];
+                        __m256 v_k = _mm256_set1_ps(valid_deltas[v]);
+                        const float* q_col_base = q_transposed + d * n_tokens_q;
 
-                    int iq = 0;
-                    // Unroll x4 (32 elements per iteration)
-                    for (; iq + 31 < n_tokens_q; iq += 32) {
                         __m256 v_q0 = _mm256_loadu_ps(q_col_base + iq);
                         __m256 v_q1 = _mm256_loadu_ps(q_col_base + iq + 8);
                         __m256 v_q2 = _mm256_loadu_ps(q_col_base + iq + 16);
                         __m256 v_q3 = _mm256_loadu_ps(q_col_base + iq + 24);
 
-                        __m256 v_res0 = _mm256_loadu_ps(&local_res[iq]);
-                        __m256 v_res1 = _mm256_loadu_ps(&local_res[iq + 8]);
-                        __m256 v_res2 = _mm256_loadu_ps(&local_res[iq + 16]);
-                        __m256 v_res3 = _mm256_loadu_ps(&local_res[iq + 24]);
-
                         v_res0 = _mm256_fmadd_ps(v_k, v_q0, v_res0);
                         v_res1 = _mm256_fmadd_ps(v_k, v_q1, v_res1);
                         v_res2 = _mm256_fmadd_ps(v_k, v_q2, v_res2);
                         v_res3 = _mm256_fmadd_ps(v_k, v_q3, v_res3);
+                    }
 
-                        _mm256_storeu_ps(&local_res[iq], v_res0);
-                        _mm256_storeu_ps(&local_res[iq + 8], v_res1);
-                        _mm256_storeu_ps(&local_res[iq + 16], v_res2);
-                        _mm256_storeu_ps(&local_res[iq + 24], v_res3);
-                    }
-                    // Tail logic
-                    for (; iq + 7 < n_tokens_q; iq += 8) {
-                        __m256 v_q = _mm256_loadu_ps(q_col_base + iq);
-                        __m256 v_res = _mm256_loadu_ps(&local_res[iq]);
-                        v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
-                        _mm256_storeu_ps(&local_res[iq], v_res);
-                    }
-                    for (; iq < n_tokens_q; iq++) {
-                        local_res[iq] += valid_deltas[v] * q_col_base[iq];
+                    // Flush registers to memory once
+                    float tmp[32];
+                    _mm256_storeu_ps(&tmp[0], v_res0);
+                    _mm256_storeu_ps(&tmp[8], v_res1);
+                    _mm256_storeu_ps(&tmp[16], v_res2);
+                    _mm256_storeu_ps(&tmp[24], v_res3);
+                    for (int i = 0; i < 32; i++) {
+                        float * out_val = (float *)(dst_head_ptr + (iq + i) * dst_nb1) + ik;
+                        *out_val += tmp[i];
                     }
                 }
-
-                // Write back
-                for (int iq = 0; iq < n_tokens_q; iq++) {
+                // Tail logic 1 (Step by 8)
+                for (; iq + 7 < n_tokens_q; iq += 8) {
+                    __m256 v_res = _mm256_setzero_ps();
+                    for (int v = 0; v < valid_count; v++) {
+                        int d = valid_d[v];
+                        __m256 v_k = _mm256_set1_ps(valid_deltas[v]);
+                        const float* q_col_base = q_transposed + d * n_tokens_q;
+                        __m256 v_q = _mm256_loadu_ps(q_col_base + iq);
+                        v_res = _mm256_fmadd_ps(v_k, v_q, v_res);
+                    }
+                    float tmp[8];
+                    _mm256_storeu_ps(tmp, v_res);
+                    for (int i = 0; i < 8; i++) {
+                        float * out_val = (float *)(dst_head_ptr + (iq + i) * dst_nb1) + ik;
+                        *out_val += tmp[i];
+                    }
+                }
+                // Tail logic 2 (Scalars)
+                for (; iq < n_tokens_q; iq++) {
+                    float res = 0;
+                    for (int v = 0; v < valid_count; v++) {
+                        int d = valid_d[v];
+                        res += valid_deltas[v] * q_transposed[d * n_tokens_q + iq];
+                    }
                     float * out_val = (float *)(dst_head_ptr + iq * dst_nb1) + ik;
-                    *out_val += local_res[iq];
+                    *out_val += res;
                 }
             }
 
@@ -2009,22 +2023,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        // ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
 
-        static bool graph_first_run = true;
-        if (graph_first_run) {
-             printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
-             graph_first_run = false;
-        }
+        // static bool graph_first_run = true;
+        // if (graph_first_run) {
+        //      printf("\n=== [GRAPH BUILDER] INJECTING SPARSE ATTN NODE ===\n");
+        //      graph_first_run = false;
+        // }
 
-        // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
-        ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
-        ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
-        ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
+        // // 即使本来是 F32，但如果是被 Permute 过的不连续内存(View)，强制过一遍 cast 生成一个纯净的、连续的新物理缓冲块 b->data！
+        // ggml_tensor * q_f32 = ggml_is_contiguous(q) && q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx0, q, GGML_TYPE_F32);
+        // ggml_tensor * k_f32 = ggml_is_contiguous(k) && k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx0, k, GGML_TYPE_F32);
+        // ggml_tensor * dummy_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k->ne[1], q->ne[1], q->ne[2], q->ne[3]);
         
-        // 正式挂载 Sparse Attention 节点
-        ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
+        // // 正式挂载 Sparse Attention 节点
+        // ggml_tensor * kq = ggml_map_custom3(ctx0, dummy_shape, q_f32, k_f32, sparse_attn, GGML_N_TASKS_MAX, nullptr);
 
         cb(kq, "kq", il);
 
